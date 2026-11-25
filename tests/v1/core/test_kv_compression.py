@@ -70,6 +70,14 @@ def test_middleware_resets_cancelled_sessions_and_keeps_other_sampling_args():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("count", [-1, True, 1.5, "2"])
+def test_reject_invalid_request_protection(count):
+    config = SimpleNamespace(additional_config={"kv_compression": {}})
+    params = SamplingParams(extra_args={"kv_protected_tokens": count})
+    with pytest.raises(ValueError, match="kv_protected_tokens"):
+        attach_http_session(config, params)
+
+
 def test_compression_scheduler_selection(monkeypatch):
     from vllm.platforms import current_platform
     from vllm.v1.core.sched.scheduler import Scheduler
@@ -234,6 +242,19 @@ def test_prefix_misses_failed_admission_and_pressure_release(engine):
     assert manager.get_computed_blocks(waiting)[1] == 0
 
 
+def test_changed_protected_prefix_rebuilds_from_full_prompt(engine):
+    manager, adapter, _, _, _ = engine
+    r = request("new-boundary", list(range(1, 12)))
+    r.sampling_params.extra_args["kv_protected_tokens"] = 5
+    manager.protected_tokens = 4  # server cap applies to explicit requests too
+    assert manager.idle[None, "agent"].protected == 2
+    assert manager.get_computed_blocks(r)[1] == 0
+    assert manager.allocate_slots(r, r.num_prompt_tokens) is not None
+    schedule_new(manager, r)
+    assert adapter.active[r.request_id].protected == 4
+    assert adapter.active[r.request_id].evicted == 0
+
+
 @pytest.mark.parametrize("sync_fails", [False, True])
 def test_failed_copy_discards_snapshot_only_after_device_ack(
     engine, monkeypatch, sync_fails
@@ -274,7 +295,8 @@ def test_failed_copy_discards_snapshot_only_after_device_ack(
     assert not manager.idle and not adapter.parked
 
 
-def test_native_schedule_to_stop_to_chunked_continuation(engine):
+@pytest.fixture
+def native_scheduler(engine):
     fixture_manager, adapter, _, _, _ = engine
     fixture_manager.evict_oldest()
     config = VllmConfig(device_config=DeviceConfig("cpu"))
@@ -299,6 +321,12 @@ def test_native_schedule_to_stop_to_chunked_continuation(engine):
     cache.bind(
         fixture_manager.rpc, {"policy": "example.KeepLast", "protected_tokens": 2}
     )
+    return scheduler, adapter
+
+
+def test_native_schedule_to_stop_to_chunked_continuation(native_scheduler):
+    scheduler, adapter = native_scheduler
+    cache = scheduler.kv_cache_manager
     a = request("first", [1, 2, 3, 4, 5])
     a.max_tokens = 3
     scheduler.add_request(a)
@@ -347,6 +375,87 @@ def test_native_schedule_to_stop_to_chunked_continuation(engine):
     step("second", 1, [11])
     scheduler.finish_requests("second", RequestStatus.FINISHED_ABORTED)
     assert cache.block_pool.get_num_free_blocks() == 7 and not cache.active
+
+
+@pytest.mark.parametrize(
+    "fail_copy,fail_sync", [(False, False), (True, False), (True, True)]
+)
+def test_active_page_ownership_and_failure_isolation(
+    native_scheduler, monkeypatch, fail_copy, fail_sync
+):
+    from vllm.v1.engine import FinishReason
+
+    scheduler, adapter = native_scheduler
+    cache = scheduler.kv_cache_manager
+    ids = ["A", "B"]
+    for name in ids:
+        scheduler.add_request(request(name, [10, 11, 12, 13], key=name))
+    output = ModelRunnerOutput(
+        req_ids=ids, req_id_to_index={"A": 0, "B": 1}, sampled_token_ids=[[], []],
+    )
+    scheduler.update_from_output(scheduler.schedule(), output)
+    batch = scheduler.schedule()
+    assert batch.num_scheduled_tokens == {"A": 2, "B": 2}
+
+    blocks = {name: cache.get_blocks(name).get_block_ids() for name in ids}
+    table = MagicMock()
+    adapter.runner.requests = {
+        name: SimpleNamespace(block_ids=tuple(g.copy() for g in groups))
+        for name, groups in blocks.items()
+    }
+    adapter.runner.input_batch = SimpleNamespace(
+        req_id_to_index=output.req_id_to_index,
+        block_table=SimpleNamespace(block_tables=[table, MagicMock()]),
+    )
+    # A frees a whole page, B loses one slot without freeing a page.
+    adapter.active["A"].pending_keep = torch.tensor([[0, 1]])
+    adapter.active["B"].pending_keep = torch.tensor([[0, 1, 3]])
+    before = cache.block_pool.get_num_free_blocks()
+    original_copy = worker.compact_layer
+
+    def copy(kv, pages, indices, protected):
+        if fail_copy and pages.tolist() == blocks["A"][0]:
+            kv[:, pages[0]] = -1
+            raise RuntimeError("partial GPU writes")
+        original_copy(kv, pages, indices, protected)
+
+    def synchronize(_):
+        assert cache.block_pool.get_num_free_blocks() == before
+        if fail_sync:
+            raise RuntimeError("synchronization failed")
+
+    monkeypatch.setattr(worker, "compact_layer", copy)
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    output.sampled_token_ids = [[14], [15]]
+    output.kv_compression_req_ids = ids
+    if fail_sync:
+        with pytest.raises(RuntimeError, match="synchronization failed"):
+            scheduler.update_from_output(batch, output)
+        assert cache.block_pool.get_num_free_blocks() == before
+        for name in ids:
+            assert cache.get_blocks(name).get_block_ids() == blocks[name]
+        return
+
+    results = scheduler.update_from_output(batch, output)[0].outputs
+    assert cache.get_blocks("B").get_block_ids() == blocks["B"]
+    assert adapter.active["B"].evicted == cache.num_evicted_tokens["B"] == 1
+    if fail_copy:
+        assert {r.request_id: r.finish_reason for r in results} == {
+            "A": FinishReason.ERROR, "B": None,
+        }
+        assert "A" not in adapter.active and "A" not in scheduler.requests
+        assert cache.block_pool.get_num_free_blocks() == before + 3
+    else:
+        assert cache.block_pool.get_num_free_blocks() == before + 1
+        assert cache.get_blocks("A").get_block_ids()[0] == blocks["A"][0][:1]
+        assert adapter.active["A"].evicted == 2
+
+    # Preemption after a live compaction replays the transcript without stale offsets.
+    b = scheduler.requests["B"]
+    scheduler.running.remove(b)
+    scheduler._preempt_request(b, 0.0)
+    assert "B" not in cache.num_evicted_tokens and adapter.active["B"].evicted == 0
+    assert b.num_computed_tokens == 0 and not cache.idle
 
 
 def test_flash_forward_observer_selects_correct_request_query_and_lse(monkeypatch):

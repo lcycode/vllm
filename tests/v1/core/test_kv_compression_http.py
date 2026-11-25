@@ -214,7 +214,10 @@ async def replay_responses(client, thread_id, *, salt=None, rewrite=False):
         "extra_headers": {"thread-id": thread_id},
         "extra_body": {"cache_salt": salt} if salt else {},
     }
-    stream = await client.responses.create(input=[user], stream=True, **opts)
+    first_body = {**opts["extra_body"], "vllm_xargs": {"kv_protected_tokens": 1}}
+    stream = await client.responses.create(
+        input=[user], stream=True, **{**opts, "extra_body": first_body}
+    )
     async with stream:
         events = [event async for event in stream]
     assert events[-1].type == "response.completed"
@@ -250,7 +253,9 @@ async def replay_chat(client, headers):
         "tools": [{"type": "function", "function": {**TOOL, "strict": True}}],
         "extra_headers": headers,
     }
-    async with client.beta.chat.completions.stream(messages=[user], **opts) as stream:
+    async with client.beta.chat.completions.stream(
+        messages=[user], extra_body={"vllm_xargs": {"kv_protected_tokens": 0}}, **opts
+    ) as stream:
         completion = await stream.get_final_completion()
     (call,) = completion.choices[0].message.tool_calls
     assert call.function.name == TOOL["name"]
@@ -376,5 +381,9 @@ def test_native_tool_turns_resume_only_their_own_session(http_server):
         assert second.num_cached_tokens == (seen if matches and key is not None else 0)
     cache = engine.scheduler.kv_cache_manager
     assert set(cache.idle) == sessions
-    assert all(snap.retained == 3 for snap in cache.idle.values())
+    # Clients supply their boundary on the first turn. The second inherits it.
+    for (_, (client_kind, *_)), snap in cache.idle.items():
+        expected = {"codex": 1, "opencode": 0, "claude-code": 2}[client_kind]
+        assert snap.protected == expected
+        assert snap.retained == expected + 1  # KeepLast retains one unprotected slot
     assert not cache.active and not cache.claimed

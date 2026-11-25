@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from . import compression_config
 
 HTTP_SESSION_ARG = "_kv_compression_http_session"
+PROTECTED_TOKENS_ARG = "kv_protected_tokens"
 _session = ContextVar[tuple[str, ...] | None]("kv_compression_session", default=None)
 
 
@@ -56,6 +57,10 @@ def attach_http_session(config: "VllmConfig", params: "SamplingParams") -> None:
     # Native HTTP requests shallow-clone SamplingParams. Only headers may
     # identify an HTTP session, even if vllm_xargs contains an offline key.
     extra = (params.extra_args or {}).copy()
+    if PROTECTED_TOKENS_ARG in extra:
+        count = extra[PROTECTED_TOKENS_ARG]
+        if type(count) is not int or count < 0:
+            raise ValueError(f"{PROTECTED_TOKENS_ARG} must be a nonnegative integer")
     if session is not None:
         extra.pop("kv_session", None)
     if session:

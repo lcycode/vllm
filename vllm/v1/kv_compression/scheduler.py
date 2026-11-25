@@ -11,11 +11,12 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.request import Request, RequestStatus
 
 from . import compression_config, worker
 from .allocator import ResidentFullAttentionManager
-from .middleware import HTTP_SESSION_ARG
+from .middleware import HTTP_SESSION_ARG, PROTECTED_TOKENS_ARG
 
 logger = init_logger(__name__)
 SessionKey = tuple[str | None, str | tuple[str, ...]]
@@ -96,6 +97,14 @@ class SessionCacheManager(KVCacheManager):
         self.discard(snapshot)
         return True
 
+    def protected_length(self, request: Request, default: int) -> int:
+        assert request.sampling_params is not None
+        extra = request.sampling_params.extra_args or {}
+        count = min(request.num_prompt_tokens, extra.get(PROTECTED_TOKENS_ARG, default))
+        if self.protected_tokens is not None:
+            count = min(count, self.protected_tokens)
+        return count
+
     def get_computed_blocks(self, request):
         key = session_key(request)
         snap = self.idle.get(key)
@@ -104,7 +113,12 @@ class SessionCacheManager(KVCacheManager):
         seen = len(snap.tokens)
         ids = request.prompt_token_ids
         # A new request needs at least one suffix token to produce fresh logits.
-        if ids is None or len(ids) <= seen or ids[:seen] != snap.tokens:
+        if (
+            ids is None
+            or len(ids) <= seen
+            or self.protected_length(request, snap.protected) != snap.protected
+            or ids[:seen] != snap.tokens
+        ):
             logger.info("KV session prefix miss for request %s", request.request_id)
             return super().get_computed_blocks(request)
 
@@ -146,8 +160,7 @@ class SessionCacheManager(KVCacheManager):
                 # A template rewrite can invalidate generated KV while leaving
                 # the original system and task boundary intact.
                 protected = previous.protected
-            if self.protected_tokens is not None:
-                protected = min(protected, self.protected_tokens)
+            protected = self.protected_length(req, protected)
             handle = None
             if claimed is not None:
                 _, snap = claimed
@@ -173,6 +186,50 @@ class SessionCacheManager(KVCacheManager):
             self.idle[key] = snap
         self.claimed.clear()
 
+    def compression_tables(self, req_id, seen):
+        tables = {}
+        resident = seen - self.num_evicted_tokens.get(req_id, 0)
+        for gid, size in self.full_groups.items():
+            group = self.managers[gid].req_to_blocks[req_id]
+            if resident > len(group) * size or any(
+                b.is_null or b.ref_cnt != 1 for b in group
+            ):
+                raise RuntimeError(
+                    "compression requires an exclusive, complete page table"
+                )
+            tables[gid] = [b.block_id for b in group]
+        return tables
+
+    def release_tail(self, req_id, retained):
+        freed = 0
+        for gid, size in self.full_groups.items():
+            used = (retained + size - 1) // size
+            group = self.managers[gid].req_to_blocks[req_id]
+            tail = group[used:]
+            del group[used:]
+            self.block_pool.free_blocks(reversed(tail))
+            freed += len(tail)
+        return freed
+
+    def compact_active(self, req_ids, requests):
+        work = {}
+        for req_id in req_ids:
+            if req_id in self.active and req_id in requests:
+                seen = requests[req_id].num_computed_tokens
+                work[req_id] = (seen, self.compression_tables(req_id, seen))
+        if not work:
+            return []
+        (results,) = self.rpc(worker.compact_active, args=(work,))
+        failed = []
+        for req_id, (seen, _) in work.items():
+            retained = results[req_id]
+            if retained is None:
+                failed.append(req_id)
+                continue
+            self.release_tail(req_id, retained)
+            self.num_evicted_tokens[req_id] = seen - retained
+        return failed
+
     def finish(self, request):
         req_id = request.request_id
         active = self.active.get(req_id)
@@ -192,31 +249,19 @@ class SessionCacheManager(KVCacheManager):
         key, protected = active
         seen = request.num_computed_tokens
         blocks = [manager.req_to_blocks[req_id] for manager in self.managers]
-        tables = {}
-        resident = seen - self.num_evicted_tokens.get(req_id, 0)
-        for gid, size in self.full_groups.items():
-            group = blocks[gid]
-            if resident > len(group) * size or any(
-                b.is_null or b.ref_cnt != 1 for b in group
-            ):
-                raise RuntimeError(
-                    "compression requires an exclusive, complete page table"
-                )
-            tables[gid] = [b.block_id for b in group]
-
+        tables = self.compression_tables(req_id, seen)
         handle = next(self.handles)
-        (result,) = self.rpc(worker.park_session, args=(req_id, handle, seen, tables))
+        last_sample = (
+            request.all_token_ids[seen] if request.num_tokens == seen + 1 else None
+        )
+        (result,) = self.rpc(
+            worker.park_session, args=(req_id, handle, seen, tables, last_sample)
+        )
         if result is None:
             del self.active[req_id]
             return
         before, retained, stats = result
-        freed = 0
-        for gid, size in self.full_groups.items():
-            used = (retained + size - 1) // size
-            tail = blocks[gid][used:]
-            del blocks[gid][used:]
-            self.block_pool.free_blocks(reversed(tail))
-            freed += len(tail)
+        freed = self.release_tail(req_id, retained)
         # Transfer ownership out of the completed request before native free().
         # Recurrent pages follow the session intact, including their logical layout.
         for manager in self.managers:
@@ -307,6 +352,26 @@ class CompressionScheduler(Scheduler):
         output = super().schedule()
         self.kv_cache_manager.after_schedule(output, self.requests)
         return output
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        failures = []
+        if req_ids := model_runner_output.kv_compression_req_ids:
+            # Process the boundary before native stop handling can park a snapshot.
+            failed = self.kv_cache_manager.compact_active(req_ids, self.requests)
+            if failed:
+                failures = self.finish_requests(failed, RequestStatus.FINISHED_ERROR)
+        outputs = super().update_from_output(scheduler_output, model_runner_output)
+        for req_id, client in failures:
+            if client not in outputs:
+                outputs[client] = EngineCoreOutputs()
+            outputs[client].outputs.append(
+                EngineCoreOutput(
+                    request_id=req_id,
+                    new_token_ids=[],
+                    finish_reason=FinishReason.ERROR,
+                )
+            )
+        return outputs
 
     def _free_blocks(self, request):
         self.kv_cache_manager.finish(request)

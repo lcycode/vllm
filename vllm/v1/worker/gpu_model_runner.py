@@ -4340,6 +4340,8 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            if self.kv_compression is not None:
+                output.kv_compression_req_ids = self.kv_compression.after_sample(output)
             return output
 
         with record_function_or_nullcontext(

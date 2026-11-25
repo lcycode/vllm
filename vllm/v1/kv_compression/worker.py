@@ -9,7 +9,7 @@ from functools import partial
 import torch
 
 from .pages import compact_layer, kernel_pages, validate_keep
-from .policy import KVCompressionPolicy, PagedQuery
+from .policy import KVCompressionPolicy, PagedQuery, PagedQueryBatch
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,7 @@ class Session:
     protected: int
     decode_from: int
     evicted: int = 0
+    pending_keep: torch.Tensor | None = None
 
 
 class CompressionRunner:
@@ -113,6 +114,13 @@ class CompressionRunner:
             cursor += n
 
         collecting = bool(self.query_rows)
+        if len(self.query_rows) > 1:
+            _, rows, tokens, lengths = zip(*self.query_rows)
+            # Request rows select page tables; packed token offsets select Q/LSE.
+            # Transfer these indices once for all layers of this forward.
+            self.batch_indices = torch.tensor(
+                (rows, tokens, lengths), dtype=torch.int32, device=positions.device
+            )
         if collecting != self.collecting:
             for index, (_, layer) in enumerate(self.layers):
                 layer.impl.kv_query_observer = (
@@ -143,6 +151,23 @@ class CompressionRunner:
 
     def observe(self, index, query, cache, block_table, lse, scale):
         size = cache.shape[2]
+        if len(self.query_rows) > 1:
+            rows, tokens, seq_used = self.batch_indices.unbind()
+            states, _, _, lengths = zip(*self.query_rows)
+            num_pages = (max(lengths) + size - 1) // size
+            batch = PagedQueryBatch(
+                query.index_select(0, tokens),
+                cache,
+                block_table[:, :num_pages].index_select(0, rows),
+                lengths,
+                seq_used,
+                lse.T.index_select(0, tokens),
+                scale,
+            )
+            self.policy_cls.observe_batch(
+                index, [state.policy for state in states], batch
+            )
+            return
         for state, row, token, length in self.query_rows:
             pages = block_table[row, : (length + size - 1) // size]
             state.policy.observe(
@@ -151,15 +176,31 @@ class CompressionRunner:
             )
 
     def after_forward(self, logits):
-        for state, _, _, _ in self.query_rows:
+        for state, _, _, length in self.query_rows:
             state.policy.end_query()
+            state.policy.check_boundary(length, state.protected)
         for state, row in self.logit_rows:
             state.policy.record_logits(logits[row])
         self.query_rows.clear()
         self.logit_rows.clear()
 
-    def compact(self, state: Session, length: int, tables: dict[int, list[int]]) -> int:
-        keep = state.policy.finish_turn(length, state.protected)
+    def after_sample(self, output):
+        compact_ids = []
+        batch = self.runner.input_batch
+        for row, tokens in enumerate(output.sampled_token_ids):
+            req_id = output.req_ids[row]
+            state = self.active.get(req_id)
+            if state is None or not tokens:
+                continue
+            (token,) = tokens  # synchronous generation without speculation
+            # Bookkeeping appended the sample, which does not have KV yet.
+            length = int(batch.num_tokens_no_spec[row]) - 1 - state.evicted
+            state.pending_keep = state.policy.on_sample(token, length, state.protected)
+            if state.pending_keep is not None:
+                compact_ids.append(req_id)
+        return compact_ids or None
+
+    def compact(self, state: Session, length: int, tables: dict[int, list[int]], keep):
         if keep is None:
             return length
         validate_keep(
@@ -180,12 +221,44 @@ class CompressionRunner:
         state.policy.apply_keep(keep)
         return keep.shape[1]
 
-    def park(self, req_id, handle, seen, tables):
+    def compact_active(self, requests):
+        retained_by_id = {}
+        batch = self.runner.input_batch
+        for req_id, (seen, tables) in requests.items():
+            state = self.active[req_id]
+            try:
+                length = seen - state.evicted
+                assert state.pending_keep is not None
+                retained = self.compact(state, length, tables, state.pending_keep)
+                row = batch.req_id_to_index[req_id]
+                blocks = self.runner.requests[req_id].block_ids
+                for gid, size in self.full_groups.items():
+                    used = (retained + size - 1) // size
+                    del blocks[gid][used:]
+                    batch.block_table.block_tables[gid].add_row(blocks[gid], row)
+                state.evicted = seen - retained
+                retained_by_id[req_id] = retained
+            except Exception:
+                logger.exception("Failed to compact active request %s", req_id)
+                retained_by_id[req_id] = None
+            finally:
+                state.pending_keep = None
+        # No pages may change ownership until all copies (including partial
+        # writes from a failed request) have completed.
+        torch.cuda.synchronize(self.runner.device)
+        return retained_by_id
+
+    def park(self, req_id, handle, seen, tables, unforwarded_token_id=None):
         state = self.active[req_id]
         length = seen - state.evicted
         result = None
         try:
-            retained = self.compact(state, length, tables)
+            if unforwarded_token_id is not None:
+                state.policy.check_boundary(
+                    length, state.protected, unforwarded_token_id=unforwarded_token_id
+                )
+            keep = state.policy.finish_turn(length, state.protected)
+            retained = self.compact(state, length, tables, keep)
             result = length, retained, state.policy.stats()
         except Exception:
             # A copy can fail after some layers have moved. Retire this session
@@ -225,8 +298,15 @@ def start_session(worker, req_id, protected, decode_from, handle=None):
 
 
 @torch.inference_mode()
-def park_session(worker, req_id, handle, seen, tables):
-    return worker.model_runner.kv_compression.park(req_id, handle, seen, tables)
+def compact_active(worker, requests):
+    return worker.model_runner.kv_compression.compact_active(requests)
+
+
+@torch.inference_mode()
+def park_session(worker, req_id, handle, seen, tables, unforwarded_token_id=None):
+    return worker.model_runner.kv_compression.park(
+        req_id, handle, seen, tables, unforwarded_token_id
+    )
 
 
 def discard_active(worker, req_id):

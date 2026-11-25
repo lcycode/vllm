@@ -3,7 +3,9 @@
 """Attention layer with FlashAttention."""
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import ClassVar
 
 import numpy as np
@@ -551,6 +553,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
+    # Set only for forwards where a compression policy requests a decode query.
+    kv_query_observer: Callable[
+        [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float], None
+    ] | None = None
 
     def __init__(
         self,
@@ -738,7 +744,11 @@ class FlashAttentionImpl(AttentionImpl):
                     if self.sliding_window is not None
                     else None
                 )
-                flash_attn_varlen_func(
+                observer = self.kv_query_observer
+                attend = flash_attn_varlen_func
+                if observer is not None:
+                    attend = partial(attend, return_softmax_lse=True)
+                result = attend(
                     q=query[:num_actual_tokens],
                     k=key_cache,
                     v=value_cache,
@@ -761,6 +771,9 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
+                if observer is not None:
+                    _, lse = result
+                    observer(query, kv_cache, block_table, lse, self.scale)
                 return output
 
         # Cascade attention (rare case).

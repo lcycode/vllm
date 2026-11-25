@@ -207,6 +207,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.kv_compression.worker import CompressionRunner
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.gpu.mm.encoder_cudagraph import EncoderCudaGraphManager
 
@@ -490,6 +491,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self.kv_compression: CompressionRunner | None = None
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -2002,11 +2004,16 @@ class GPUModelRunner(
         )
         self.seq_lens[num_reqs:].fill_(0)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
-        )
+        starts = self.query_start_loc.gpu[: num_reqs + 1]
+        positions = self.positions[:total_num_scheduled_tokens]
+        if self.kv_compression is None:
+            self.input_batch.block_table.compute_slot_mapping(
+                num_reqs, starts, positions
+            )
+        else:
+            self.kv_compression.prepare_slots(
+                num_reqs, starts, positions, req_indices_gpu, num_scheduled_tokens
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2290,6 +2297,8 @@ class GPUModelRunner(
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
+            if self.kv_compression is not None and not for_cudagraph_capture:
+                self.kv_compression.adjust_metadata(kv_cache_gid, cm)
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -4098,6 +4107,8 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if self.kv_compression is not None:
+            self.kv_compression.after_forward(logits)
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,

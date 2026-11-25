@@ -65,6 +65,8 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    kv_cache_manager_cls = KVCacheManager
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -222,7 +224,7 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
 
         # Create the KV cache manager.
-        self.kv_cache_manager = KVCacheManager(
+        self.kv_cache_manager = self.kv_cache_manager_cls(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             enable_caching=self.cache_config.enable_prefix_caching,

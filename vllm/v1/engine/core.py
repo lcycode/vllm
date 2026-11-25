@@ -69,6 +69,7 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.executor import Executor
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_compression import get_compression_scheduler
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -101,6 +102,7 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        compression_scheduler = get_compression_scheduler(vllm_config)
         if not vllm_config.parallel_config.data_parallel_rank_local:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -125,7 +127,9 @@ class EngineCore:
         self.structured_output_manager = StructuredOutputManager(vllm_config)
 
         # Setup scheduler.
-        Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+        Scheduler = (
+            compression_scheduler or vllm_config.scheduler_config.get_scheduler_cls()
+        )
 
         if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102
             # Encoder models without KV cache don't support
@@ -149,6 +153,8 @@ class EngineCore:
             block_size=scheduler_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        if bind_worker_rpc := getattr(self.scheduler, "bind_worker_rpc", None):
+            bind_worker_rpc(self.model_executor.collective_rpc)
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
